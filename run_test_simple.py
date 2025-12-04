@@ -22,34 +22,28 @@ def main():
         env['OMPI_COMM_WORLD_RANK'] = str(rank)
         env['OMPI_COMM_WORLD_SIZE'] = str(num_processes)
         
-        # 启动进程
+        # 启动进程 - 直接输出到终端，不捕获
         proc = subprocess.Popen(
             ['./nccl_split_test'],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            env=env
         )
-        processes.append(proc)
+        processes.append((rank, proc))
         print(f"✓ 进程 {rank} 已启动 (PID: {proc.pid})")
     
     print("\n等待所有进程完成...")
     print("=" * 50)
+    print("(输出将实时显示)\n")
     
     # 等待所有进程完成
     all_success = True
-    for rank, proc in enumerate(processes):
-        stdout, stderr = proc.communicate()
+    for rank, proc in processes:
+        returncode = proc.wait()
         
-        if proc.returncode == 0:
-            print(f"\n[进程 {rank}] 输出:")
-            if stdout:
-                print(stdout)
+        if returncode == 0:
+            print(f"✓ 进程 {rank} 完成")
         else:
-            print(f"\n[进程 {rank}] 失败 (返回码: {proc.returncode})")
+            print(f"✗ 进程 {rank} 失败 (返回码: {returncode})")
             all_success = False
-            if stderr:
-                print(f"错误信息:\n{stderr}")
     
     print("\n" + "=" * 50)
     if all_success:

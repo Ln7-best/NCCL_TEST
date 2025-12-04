@@ -38,7 +38,15 @@ fi
 # 4. 运行测试
 echo -e "\n[4] 运行测试..."
 echo "======================================"
-mpiexec -n 8 python3 run_nccl_test.py
+# 尝试使用 mpiexec，如果不存在则使用简单的 Python 启动脚本
+if command -v mpiexec &> /dev/null; then
+    mpiexec -n 8 python3 run_nccl_test.py
+elif command -v mpirun &> /dev/null; then
+    mpirun -np 8 python3 run_nccl_test.py
+else
+    echo "未找到 mpiexec/mpirun，使用简单启动脚本..."
+    python3 run_test_simple.py
+fi
 
 echo -e "\n======================================"
 echo "测试完成！"

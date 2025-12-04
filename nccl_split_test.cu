@@ -1,10 +1,27 @@
 #include <nccl.h>
 #include <cuda_runtime.h>
-#include <mpi.h>
 #include <iostream>
 #include <vector>
 #include <chrono>
 #include <iomanip>
+#include <cstdlib>
+#include <fstream>
+#include <unistd.h>
+
+// 从环境变量获取 rank 和 size
+int get_rank() {
+    const char* rank_str = std::getenv("OMPI_COMM_WORLD_RANK");
+    if (!rank_str) rank_str = std::getenv("PMI_RANK");
+    if (!rank_str) rank_str = std::getenv("SLURM_PROCID");
+    return rank_str ? std::atoi(rank_str) : 0;
+}
+
+int get_world_size() {
+    const char* size_str = std::getenv("OMPI_COMM_WORLD_SIZE");
+    if (!size_str) size_str = std::getenv("PMI_SIZE");
+    if (!size_str) size_str = std::getenv("SLURM_NTASKS");
+    return size_str ? std::atoi(size_str) : 1;
+}
 
 #define CUDACHECK(cmd) do {                         \
   cudaError_t err = cmd;                           \
@@ -34,11 +51,109 @@ public:
     }
 };
 
+// 简单的进程间同步：通过文件系统
+void barrier(int rank, int size, const std::string& barrier_name) {
+    std::string barrier_dir = "/tmp/nccl_barrier_" + barrier_name;
+    std::string my_file = barrier_dir + "/rank_" + std::to_string(rank);
+    
+    // Rank 0 创建目录
+    if (rank == 0) {
+        system(("mkdir -p " + barrier_dir).c_str());
+    }
+    usleep(100000); // 等待目录创建
+    
+    // 每个进程创建自己的文件
+    std::ofstream(my_file).close();
+    
+    // 等待所有进程到达
+    while (true) {
+        int count = 0;
+        for (int i = 0; i < size; i++) {
+            std::string file = barrier_dir + "/rank_" + std::to_string(i);
+            std::ifstream f(file);
+            if (f.good()) count++;
+        }
+        if (count == size) break;
+        usleep(10000); // 10ms
+    }
+    
+    // Rank 0 清理
+    if (rank == 0) {
+        system(("rm -rf " + barrier_dir).c_str());
+    }
+}
+
+// 广播 NCCL unique ID
+void broadcast_nccl_id(ncclUniqueId* id, int rank, int size) {
+    std::string id_file = "/tmp/nccl_unique_id";
+    
+    if (rank == 0) {
+        // Rank 0 生成并写入文件
+        ncclGetUniqueId(id);
+        std::ofstream f(id_file, std::ios::binary);
+        f.write(reinterpret_cast<char*>(id), sizeof(ncclUniqueId));
+        f.close();
+    }
+    
+    barrier(rank, size, "id_broadcast");
+    
+    if (rank != 0) {
+        // 其他 rank 读取
+        std::ifstream f(id_file, std::ios::binary);
+        f.read(reinterpret_cast<char*>(id), sizeof(ncclUniqueId));
+        f.close();
+    }
+    
+    barrier(rank, size, "id_read");
+    
+    if (rank == 0) {
+        unlink(id_file.c_str());
+    }
+}
+
 // 获取所有进程中的最大时间
 double get_max_time(double local_time, int rank, int size) {
-    double max_time;
-    MPI_Reduce(&local_time, &max_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    MPI_Bcast(&max_time, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    // 写入本地时间
+    std::string time_file = "/tmp/nccl_time_rank_" + std::to_string(rank);
+    std::ofstream f(time_file);
+    f << std::fixed << std::setprecision(6) << local_time;
+    f.close();
+    
+    barrier(rank, size, "time_reduce");
+    
+    // Rank 0 收集所有时间
+    double max_time = local_time;
+    if (rank == 0) {
+        for (int i = 0; i < size; i++) {
+            std::string file = "/tmp/nccl_time_rank_" + std::to_string(i);
+            std::ifstream inf(file);
+            double t;
+            inf >> t;
+            if (t > max_time) max_time = t;
+            inf.close();
+            unlink(file.c_str());
+        }
+        // 写入最大时间
+        std::ofstream outf("/tmp/nccl_max_time");
+        outf << std::fixed << std::setprecision(6) << max_time;
+        outf.close();
+    }
+    
+    barrier(rank, size, "time_broadcast");
+    
+    // 所有进程读取最大时间
+    if (rank != 0) {
+        std::ifstream inf("/tmp/nccl_max_time");
+        inf >> max_time;
+        inf.close();
+    }
+    
+    barrier(rank, size, "time_read");
+    
+    if (rank == 0) {
+        unlink("/tmp/nccl_max_time");
+    }
+    
     return max_time;
 }
 
@@ -50,7 +165,8 @@ void test_direct_7gpu_comm(int rank, int size) {
     
     // 只有前7个rank参与
     if (rank >= 7) {
-        MPI_Barrier(MPI_COMM_WORLD);
+        barrier(rank, size, "test1_start");
+        barrier(rank, size, "test1_end");
         return;
     }
     
@@ -63,14 +179,11 @@ void test_direct_7gpu_comm(int rank, int size) {
     
     Timer timer;
     
-    // Rank 0 生成唯一ID并广播
-    if (rank == 0) {
-        ncclGetUniqueId(&id);
-    }
-    MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+    // 广播 unique ID
+    broadcast_nccl_id(&id, rank, size);
     
-    // 所有7个rank同步后开始计时
-    MPI_Barrier(MPI_COMM_WORLD);
+    // 同步后开始计时
+    barrier(rank, size, "test1_start");
     timer.tic();
     
     // 直接创建7卡通信组
@@ -92,7 +205,7 @@ void test_direct_7gpu_comm(int rank, int size) {
     CUDACHECK(cudaMemset(d_data, 1, dataSize * sizeof(float)));
     
     // 同步后测试第一次AllReduce
-    MPI_Barrier(MPI_COMM_WORLD);
+    barrier(rank, size, "test1_allreduce");
     timer.tic();
     
     NCCLCHECK(ncclAllReduce(d_data, d_data, dataSize, 
@@ -116,7 +229,7 @@ void test_direct_7gpu_comm(int rank, int size) {
     CUDACHECK(cudaStreamDestroy(stream));
     ncclCommDestroy(comm);
     
-    MPI_Barrier(MPI_COMM_WORLD);
+    barrier(rank, size, "test1_end");
 }
 
 // 测试从8卡通信组split出7卡通信组
@@ -134,14 +247,11 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
     
     Timer timer;
     
-    // Rank 0 生成唯一ID并广播
-    if (rank == 0) {
-        ncclGetUniqueId(&id);
-    }
-    MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
+    // 广播 unique ID
+    broadcast_nccl_id(&id, rank, size);
     
-    // 所有8个rank同步后开始计时
-    MPI_Barrier(MPI_COMM_WORLD);
+    // 同步后开始计时
+    barrier(rank, size, "test2_start");
     timer.tic();
     
     // 先创建8卡通信组
@@ -156,7 +266,7 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
     }
     
     // 从8卡split出7卡（排除第7号卡,即rank 7）
-    MPI_Barrier(MPI_COMM_WORLD);
+    barrier(rank, size, "test2_split");
     timer.tic();
     
     int color = (rank == 7) ? NCCL_SPLIT_NOCOLOR : 0; // rank 7不参与
@@ -179,7 +289,7 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
         CUDACHECK(cudaMemset(d_data, 1, dataSize * sizeof(float)));
         
         // 同步后测试第一次AllReduce
-        MPI_Barrier(MPI_COMM_WORLD);
+        barrier(rank, size, "test2_allreduce");
         timer.tic();
         
         NCCLCHECK(ncclAllReduce(d_data, d_data, dataSize, 
@@ -204,34 +314,28 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
         ncclCommDestroy(comm_7);
     } else {
         // rank 7 等待其他rank完成
-        MPI_Barrier(MPI_COMM_WORLD);
+        barrier(rank, size, "test2_allreduce");
     }
     
     ncclCommDestroy(comm_8);
-    MPI_Barrier(MPI_COMM_WORLD);
+    barrier(rank, size, "test2_end");
 }
 
 int main(int argc, char* argv[]) {
-    // 初始化MPI
-    MPI_Init(&argc, &argv);
-    
-    int rank, size;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    int rank = get_rank();
+    int size = get_world_size();
     
     if (rank == 0) {
-        std::cout << "NCCL CommSplit 性能测试 (多进程版本)" << std::endl;
+        std::cout << "NCCL CommSplit 性能测试 (无 MPI 版本)" << std::endl;
         std::cout << "======================================" << std::endl;
-        std::cout << "MPI 进程数: " << size << std::endl;
+        std::cout << "进程数: " << size << std::endl;
     }
     
     // 检查进程数
     if (size != 8) {
         if (rank == 0) {
-            std::cerr << "错误: 需要恰好8个MPI进程！" << std::endl;
-            std::cerr << "请使用: mpirun -np 8 ./nccl_split_test" << std::endl;
+            std::cerr << "错误: 需要恰好8个进程！" << std::endl;
         }
-        MPI_Finalize();
         return 1;
     }
     
@@ -246,21 +350,16 @@ int main(int argc, char* argv[]) {
         if (rank == 0) {
             std::cerr << "需要至少8张GPU才能运行此测试！" << std::endl;
         }
-        MPI_Finalize();
         return 1;
     }
     
-    // 测试1: 直接创建7卡通信组
+    // 运行测试
     test_direct_7gpu_comm(rank, size);
-    
-    // 测试2: 从8卡split出7卡
     test_split_7gpu_from_8gpu(rank, size);
     
     if (rank == 0) {
-        std::cout << "\n=== 总结 ===" << std::endl;
-        std::cout << "请对比以上两种方式的通信组创建时间和第一次AllReduce性能" << std::endl;
+        std::cout << "\n测试完成！" << std::endl;
     }
     
-    MPI_Finalize();
     return 0;
 }

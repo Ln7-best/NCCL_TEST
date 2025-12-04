@@ -15,7 +15,7 @@ CUDA_HOME ?= /usr/local/cuda
 INCLUDES = -I$(NCCL_HOME)/include -I$(CUDA_HOME)/include
 
 # 库链接（不需要 MPI）
-LIBS = -L$(NCCL_HOME)/lib -L$(CUDA_HOME)/lib64 -lnccl -lcudart -Wl,-rpath,$(NCCL_HOME)/lib
+LIBS = -L$(NCCL_HOME)/lib -L$(CUDA_HOME)/lib64 -lnccl -lcudart -Xlinker -rpath -Xlinker $(NCCL_HOME)/lib
 
 # 目标文件
 TARGET = nccl_split_test

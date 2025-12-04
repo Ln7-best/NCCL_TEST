@@ -163,9 +163,15 @@ void test_direct_7gpu_comm(int rank, int size) {
         std::cout << "\n=== Test 1: 直接创建 7 卡通信组 ===" << std::endl;
     }
     
-    // 只有前7个rank参与
+    ncclUniqueId id;
+    
+    // 广播 unique ID - 所有进程都要参与
+    broadcast_nccl_id(&id, rank, size);
+    
+    // 只有前7个rank参与后续操作
     if (rank >= 7) {
         barrier(rank, size, "test1_start");
+        barrier(rank, size, "test1_allreduce");
         barrier(rank, size, "test1_end");
         return;
     }
@@ -174,13 +180,9 @@ void test_direct_7gpu_comm(int rank, int size) {
     CUDACHECK(cudaSetDevice(rank));
     
     ncclComm_t comm;
-    ncclUniqueId id;
     cudaStream_t stream;
     
     Timer timer;
-    
-    // 广播 unique ID
-    broadcast_nccl_id(&id, rank, size);
     
     // 同步后开始计时
     barrier(rank, size, "test1_start");
@@ -190,12 +192,6 @@ void test_direct_7gpu_comm(int rank, int size) {
     NCCLCHECK(ncclCommInitRank(&comm, 7, id, rank));
     
     double local_init_time = timer.toc();
-    double init_time = get_max_time(local_init_time, rank, size);
-    
-    if (rank == 0) {
-        std::cout << "通信组创建时间: " << std::fixed << std::setprecision(3) 
-                  << init_time << " ms" << std::endl;
-    }
     
     // 创建stream并准备数据
     CUDACHECK(cudaStreamCreate(&stream));
@@ -213,14 +209,16 @@ void test_direct_7gpu_comm(int rank, int size) {
     CUDACHECK(cudaStreamSynchronize(stream));
     
     double local_allreduce_time = timer.toc();
-    double allreduce_time = get_max_time(local_allreduce_time, rank, size);
     
     if (rank == 0) {
         double data_gb = (dataSize * sizeof(float)) / (1024.0 * 1024.0 * 1024.0);
-        double bus_bandwidth = data_gb * 2 * 6 / 7 / (allreduce_time / 1000.0);
         
-        std::cout << "第一次 AllReduce 时间: " << allreduce_time << " ms" << std::endl;
+        std::cout << "通信组创建时间: " << std::fixed << std::setprecision(3) 
+                  << local_init_time << " ms" << std::endl;
+        std::cout << "第一次 AllReduce 时间: " << local_allreduce_time << " ms" << std::endl;
         std::cout << "数据大小: " << data_gb << " GB" << std::endl;
+        
+        double bus_bandwidth = data_gb * 2 * 6 / 7 / (local_allreduce_time / 1000.0);
         std::cout << "算法带宽 (Algbw): " << bus_bandwidth << " GB/s" << std::endl;
     }
     
@@ -258,11 +256,10 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
     NCCLCHECK(ncclCommInitRank(&comm_8, 8, id, rank));
     
     double local_init_8gpu_time = timer.toc();
-    double init_8gpu_time = get_max_time(local_init_8gpu_time, rank, size);
     
     if (rank == 0) {
         std::cout << "8卡通信组创建时间: " << std::fixed << std::setprecision(3) 
-                  << init_8gpu_time << " ms" << std::endl;
+                  << local_init_8gpu_time << " ms" << std::endl;
     }
     
     // 从8卡split出7卡（排除第7号卡,即rank 7）
@@ -273,11 +270,10 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
     NCCLCHECK(ncclCommSplit(comm_8, color, rank, &comm_7, NULL));
     
     double local_split_time = timer.toc();
-    double split_time = get_max_time(local_split_time, rank, size);
     
     if (rank == 0) {
-        std::cout << "CommSplit 时间: " << split_time << " ms" << std::endl;
-        std::cout << "总创建时间 (8卡+split): " << (init_8gpu_time + split_time) << " ms" << std::endl;
+        std::cout << "CommSplit 时间: " << local_split_time << " ms" << std::endl;
+        std::cout << "总创建时间 (8卡+split): " << (local_init_8gpu_time + local_split_time) << " ms" << std::endl;
     }
     
     // 只有前7个rank在7卡通信组上测试AllReduce
@@ -297,13 +293,12 @@ void test_split_7gpu_from_8gpu(int rank, int size) {
         CUDACHECK(cudaStreamSynchronize(stream));
         
         double local_allreduce_time = timer.toc();
-        double allreduce_time = get_max_time(local_allreduce_time, rank, size);
         
         if (rank == 0) {
             double data_gb = (dataSize * sizeof(float)) / (1024.0 * 1024.0 * 1024.0);
-            double bus_bandwidth = data_gb * 2 * 6 / 7 / (allreduce_time / 1000.0);
+            double bus_bandwidth = data_gb * 2 * 6 / 7 / (local_allreduce_time / 1000.0);
             
-            std::cout << "第一次 AllReduce 时间: " << allreduce_time << " ms" << std::endl;
+            std::cout << "第一次 AllReduce 时间: " << local_allreduce_time << " ms" << std::endl;
             std::cout << "数据大小: " << data_gb << " GB" << std::endl;
             std::cout << "算法带宽 (Algbw): " << bus_bandwidth << " GB/s" << std::endl;
         }
